@@ -1,0 +1,212 @@
+---
+title: "Data Exploration Project"
+output: html_document
+date: "2026-02-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install Pacakges
+
+```{r}
+
+library(modelsummary)
+
+library(tidyverse)
+library(lubridate)
+library(fixest)
+
+```
+
+
+# Load data And Data Preparation (Date Conversion)
+```{r}
+sales <- read_csv("Walmart_Sales (1).csv")
+# 1. Load Data 
+
+walmart <- sales %>%
+  mutate(
+    Date    = dmy(Date),        
+    Year    = year(Date),
+    Month   = month(Date),         
+    Store   = factor(Store),     
+    Temp_sq = Temperature^2        
+  )
+```
+```{r}
+walmart
+```
+
+# Graphical Analysis
+
+```{r}
+
+# 2. Graph 1: Is the relationship linear?
+
+
+ggplot(walmart, aes(x = Temperature, y = Weekly_Sales / 1e6)) +
+  geom_point(alpha = 0.12, size = 0.7, color = "gray40") +
+  geom_smooth(method = "lm",    se = TRUE,  color = "steelblue",
+              linewidth = 1, linetype = "solid") +
+  geom_smooth(method = "loess", se = FALSE, color = "tomato",
+              linewidth = 1, linetype = "dashed") +
+  labs(
+    title   = "Weekly Sales vs. Temperature (Raw Data)",
+    x       = "Temperature (degrees F)",
+    y       = "Weekly Sales (millions $)",
+    caption = "Blue = linear fit; Red dashed = LOESS smoother"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r}
+
+# 3. Graph 2: Seasonal co-movement
+#    Motivates month-of-year fixed effects
+
+walmart %>%
+  group_by(Month) %>%
+  summarize(
+    avg_sales = mean(Weekly_Sales) / 1e6,
+    avg_temp  = mean(Temperature),
+    .groups   = "drop"
+  ) %>%
+  ggplot(aes(x = Month)) +
+  geom_col(aes(y = avg_sales), fill = "steelblue", alpha = 0.75, width = 0.7) +
+  geom_line(aes(y = avg_temp / 30), color = "tomato", linewidth = 1.2) +
+  geom_point(aes(y = avg_temp / 30), color = "tomato", size = 2.5) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_y_continuous(
+    name     = "Avg Weekly Sales (millions $)",
+    sec.axis = sec_axis(~ . * 30, name = "Avg Temperature (degrees F)")
+  ) +
+  labs(
+    title   = "Seasonality: Sales (bars) and Temperature (line) by Month",
+    x       = NULL,
+    caption = "Temperature axis on the right."
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+```{r}
+
+# 4. Graph 3: Heteroskedasticity check
+#    Motivates cluster-robust standard errors
+
+basic_mod <- lm(Weekly_Sales ~ Temperature + Temp_sq + Holiday_Flag +
+                  Fuel_Price + CPI + Unemployment,
+                data = walmart)
+
+tibble(
+  fitted   = fitted(basic_mod),
+  residual = residuals(basic_mod)
+) %>%
+  ggplot(aes(x = fitted / 1e6, y = residual / 1e6)) +
+  geom_point(alpha = 0.15, size = 0.7, color = "gray40") +
+  geom_hline(yintercept = 0, color = "tomato", linewidth = 1) +
+  labs(
+    title   = "Residuals vs. Fitted Values (Basic OLS, No Fixed Effects)",
+    x       = "Fitted Values (millions $)",
+    y       = "Residuals (millions $)",
+    caption = "Fan-shaped spread = heteroskedasticity -> cluster-robust SEs"
+  ) +
+  theme_minimal(base_size = 12)
+
+```
+
+# Regression Analysis
+
+```{r}
+# 5. Main regression
+#    Store FE + month-of-year FE + cluster-robust SEs (by store)
+#    Quadratic temperature term
+
+main_mod <- feols(
+  Weekly_Sales ~ Temperature + Temp_sq + Holiday_Flag +
+    Fuel_Price + CPI + Unemployment |
+    Store + Month,          # fixed effects after the pipe
+  data    = walmart,
+  cluster = ~Store          # cluster-robust SEs at the store level
+)
+
+# Linear model for comparison
+linear_mod <- feols(
+  Weekly_Sales ~ Temperature + Holiday_Flag +
+    Fuel_Price + CPI + Unemployment |
+    Store + Month,
+  data    = walmart,
+  cluster = ~Store
+)
+
+# Regression table
+modelsummary(
+  list("(1) Linear Temp" = linear_mod,
+       "(2) Quadratic Temp" = main_mod),
+  stars       = TRUE,
+  gof_map     = c("nobs", "r.squared", "adj.r.squared"),
+  coef_rename = c(
+    "Temperature"  = "Temperature (F)",
+    "Temp_sq"      = "Temperature-squared (F sq)",
+    "Holiday_Flag" = "Holiday Week",
+    "Fuel_Price"   = "Fuel Price ($/gal)",
+    "CPI"          = "Consumer Price Index",
+    "Unemployment" = "Unemployment Rate"
+  ),
+  title = "Effect of Temperature on Weekly Walmart Sales",
+  notes = "Store and month-of-year fixed effects in all models. SEs clustered by store."
+)
+
+```
+# Marginal Effects plot
+
+```{r}
+# 6. Marginal effects plot
+#    ME = b1 + 2*b2*T  (varies with temperature level)
+
+b1 <- coef(main_mod)["Temperature"]
+b2 <- coef(main_mod)["Temp_sq"]
+
+# Delta method: Var(b1 + 2T*b2) = Var(b1) + 4T^2*Var(b2) + 4T*Cov(b1,b2)
+V <- vcov(main_mod)[c("Temperature", "Temp_sq"), c("Temperature", "Temp_sq")]
+
+temp_seq <- seq(min(walmart$Temperature), max(walmart$Temperature), length.out = 300)
+
+me_df <- tibble(
+  temp  = temp_seq,
+  me    = b1 + 2 * b2 * temp_seq,
+  se_me = sqrt(V[1,1] + 4*temp_seq^2*V[2,2] + 4*temp_seq*V[1,2]),
+  lower = me - 1.96 * se_me,
+  upper = me + 1.96 * se_me
+)
+
+ggplot(me_df, aes(x = temp, y = me / 1e3)) +
+  geom_ribbon(aes(ymin = lower / 1e3, ymax = upper / 1e3),
+              alpha = 0.2, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title   = "Marginal Effect of Temperature on Weekly Sales",
+    x       = "Temperature (degrees F)",
+    y       = "Marginal Effect (thousands $ per degree F)",
+    caption = "Shaded band = 95% CI. Dashed line at zero."
+  ) +
+  theme_minimal(base_size = 12)
+
+# ------------------------------------------------------------
+# 7. Turning point and selected marginal effects
+# ------------------------------------------------------------
+
+turning_pt <- -b1 / (2 * b2)
+cat(sprintf("Sales-maximizing temperature: %.1f degrees F\n\n", turning_pt))
+
+cat("Marginal effects at select temperatures:\n")
+for (t in c(20, 40, turning_pt, 75, 90, 100)) {
+  me_val <- (b1 + 2 * b2 * t) / 1000
+  cat(sprintf("  %5.1f F:  %+.1f thousand dollars per degree F\n", t, me_val))
+}
+
+```
+
